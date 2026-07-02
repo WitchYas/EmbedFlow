@@ -1,0 +1,182 @@
+name: Firmware Validation Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware/**'
+      - 'agents/**'
+      - 'simulators/**'
+  workflow_dispatch:
+
+env:
+  PIPELINE_API_URL: ${{ secrets.PIPELINE_API_URL }}
+  FIRMWARE_IMAGE: ${{ secrets.FIRMWARE_IMAGE || 'ubuntu:22.04' }}
+  DEVICE_PROFILE: rpi4
+  POLL_INTERVAL_SECONDS: 20
+  MAX_POLLS: 30
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate API URL
+        run: |
+          if [ -z "$PIPELINE_API_URL" ]; then
+            echo "PIPELINE_API_URL secret is required."
+            exit 1
+          fi
+
+      - name: Read firmware manifest
+        id: manifest
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          data = {}
+          path = Path("firmware/manifest.yml")
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#") or ":" not in line:
+                      continue
+                  key, value = line.split(":", 1)
+                  data[key.strip()] = value.strip().strip('"').strip("'")
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"version={data.get('version','unknown')}\n")
+              f.write(f"image={data.get('image','ubuntu:22.04')}\n")
+              f.write(f"profile={data.get('device_profile','rpi4')}\n")
+          PY
+
+      - name: Trigger pipeline
+        id: trigger
+        run: |
+          RESPONSE=$(curl -sS -X POST "$PIPELINE_API_URL/pipeline/trigger" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "firmware_path": "${{ steps.manifest.outputs.version }}",
+              "device_profile": "${{ steps.manifest.outputs.profile }}",
+              "firmware_image": "${{ steps.manifest.outputs.image }}"
+            }')
+          echo "Response: $RESPONSE"
+          RUN_ID=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('run_id',''))")
+          if [ -z "$RUN_ID" ]; then
+            echo "Failed to parse run_id from response."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "✅ Pipeline triggered: $RUN_ID"
+
+      - name: Post pending status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "$GITHUB_API_URL/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "context": "ai-embedded-devops/pipeline",
+              "description": "Pipeline running",
+              "target_url": "'"$PIPELINE_API_URL"'/docs"
+            }'
+
+      - name: Poll for result
+        id: result
+        run: |
+          RUN_ID="${{ steps.trigger.outputs.run_id }}"
+          echo "Polling $RUN_ID..."
+
+          DECISION=""
+          CONFIDENCE=""
+
+          for i in $(seq 1 "$MAX_POLLS"); do
+            sleep "$POLL_INTERVAL_SECONDS"
+            RESULT=$(curl -sS "$PIPELINE_API_URL/pipeline/runs/$RUN_ID")
+            STATUS=$(echo "$RESULT" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('status','unknown'))")
+            echo "Attempt $i — status: $STATUS"
+
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "error" ]; then
+              DECISION=$(echo "$RESULT" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('decision','unknown'))")
+              CONFIDENCE=$(echo "$RESULT" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('confidence','0'))")
+              echo "decision=$DECISION" >> $GITHUB_OUTPUT
+              echo "confidence=$CONFIDENCE" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
+
+          if [ -z "$DECISION" ]; then
+            echo "Timed out waiting for pipeline result."
+            exit 1
+          fi
+
+      - name: Post final status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DECISION="${{ steps.result.outputs.decision }}"
+          CONFIDENCE="${{ steps.result.outputs.confidence }}"
+
+          STATE="error"
+          if [ "$DECISION" = "DEPLOY" ]; then
+            STATE="success"
+          elif [ "$DECISION" = "BLOCK" ]; then
+            STATE="failure"
+          elif [ "$DECISION" = "REVIEW" ]; then
+            STATE="error"
+          fi
+
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "$GITHUB_API_URL/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "'"$STATE"'",
+              "context": "ai-embedded-devops/pipeline",
+              "description": "Decision: '"$DECISION"' (confidence '"$CONFIDENCE"')",
+              "target_url": "'"$PIPELINE_API_URL"'/docs"
+            }'
+
+      - name: Enforce decision
+        run: |
+          DECISION="${{ steps.result.outputs.decision }}"
+          CONFIDENCE="${{ steps.result.outputs.confidence }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Decision:   $DECISION"
+          echo "  Confidence: $CONFIDENCE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ "$DECISION" = "BLOCK" ]; then
+            echo "❌ BLOCKED — firmware rejected by security scan"
+            exit 1
+          elif [ "$DECISION" = "REVIEW" ]; then
+            echo "⚠️  REVIEW — manual approval required"
+            exit 0
+          else
+            echo "✅ APPROVED — firmware cleared for deployment"
+            exit 0
+          fi
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## 🤖 AI Pipeline Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Decision | ${{ steps.result.outputs.decision }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Confidence | ${{ steps.result.outputs.confidence }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run ID | ${{ steps.trigger.outputs.run_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | http://localhost:8501 |" >> $GITHUB_STEP_SUMMARY
