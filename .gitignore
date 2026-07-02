@@ -1,0 +1,54 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+site/
+pip-wheel-metadata/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+dash_venv/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Node / frontend
+node_modules/
+dist/
+coverage/
+vite.svg
+
+# Logs and runtime files
+*.log
+*.pid
+*.pid.lock
+*.seed
+*.sqlite3
+*.db
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker / compose local artifacts
+docker-compose.override.yml
