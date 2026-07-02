@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: rpi4_simulator
+    static_configs:
+      - targets: ['172.18.0.6:8080']
+    metrics_path: /metrics
